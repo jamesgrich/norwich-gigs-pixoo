@@ -1,0 +1,6 @@
+{
+  "pixooIp": "192.168.x.x",
+  "tmApiKey": "YOUR_TICKETMASTER_API_KEY",
+  "city": "Norwich",
+  "country": "GB"
+}

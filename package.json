@@ -1,0 +1,15 @@
+{
+  "name": "norwich-gigs-pixoo",
+  "version": "1.0.0",
+  "description": "Tonight's gigs in Norwich on Divoom Pixoo 64",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "canvas": "^3.2.0",
+    "cheerio": "^1.2.0",
+    "node-fetch": "^3.3.2"
+  }
+}
