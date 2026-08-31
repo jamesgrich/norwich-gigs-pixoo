@@ -12,6 +12,17 @@ const REFRESH_MS = 30 * 60_000;   // re-fetch every 30 min
 const LOCK_FILE  = './gigs.lock';
 const UA         = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/122.0 Safari/537.36';
 
+// ── Fetch with timeout ────────────────────────────────────────────────────────
+async function tfetch(url, opts = {}, ms = 15_000) {
+  const ac = new AbortController();
+  const id = setTimeout(() => ac.abort(), ms);
+  try {
+    return await fetch(url, { ...opts, signal: ac.signal });
+  } finally {
+    clearTimeout(id);
+  }
+}
+
 // ── Material Design colours ────────────────────────────────────────────────────
 const C = {
   bg:      '#121212',
@@ -145,11 +156,11 @@ function toData(cv) {
 
 // ── Send GIF to Pixoo ──────────────────────────────────────────────────────────
 let picId = 200;
-async function send(frames, ms) {
+async function sendOnce(frames, ms) {
   picId = (picId % 9999) + 1;
   const id = picId;
   await Promise.all(frames.map((frame, i) =>
-    fetch(`http://${PIXOO_IP}/post`, {
+    tfetch(`http://${PIXOO_IP}/post`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -161,8 +172,22 @@ async function send(frames, ms) {
         PicSpeed: ms,
         PicData: frame,
       }),
-    })
+    }, 5_000)
   ));
+}
+
+// Retries a few times with backoff — a single dropped WiFi/DNS blip shouldn't
+// leave the display stuck on stale data for a full REFRESH_MS cycle.
+async function send(frames, ms, attempts = 3) {
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await sendOnce(frames, ms);
+    } catch (e) {
+      if (i === attempts) throw e;
+      console.error(`send() failed (attempt ${i}/${attempts}): ${e.message} — retrying`);
+      await new Promise(r => setTimeout(r, 2_000 * i));
+    }
+  }
 }
 
 // ── Shared header ─────────────────────────────────────────────────────────────
@@ -192,47 +217,50 @@ function frameGig(gig, idx, total) {
   drawHeader(cx);
   const maxW = SIZE - 4;
   let y = 14;
+  const TIME_Y = 51; // fixed row for time/price — dots at 59, text 5px tall
 
-  // Band name — scale 2 if fits in one line, else wrap at scale 1
-  const safeName = gig.name.toLowerCase().replace(/[^a-z0-9 \-'!£.:/]/g, '').replace(/  +/g, ' ').trim();
+  // Band name — scale 2 if fits in one line, else wrap at scale 1 (max 2 lines)
+  const safeName = gig.name.toLowerCase()
+    .replace(/\s*[@–]\s*(epic|uea|arts|waterfront|brickmakers|norwich|lcr|playhouse|theatre|studio|voodoo).*/i, '')
+    .replace(/[^a-z0-9 \-'!£.:/]/g, '').replace(/  +/g, ' ').trim();
   if (pfWidth(safeName, 2) <= maxW) {
     pfCenter(cx, safeName, y, C.band, 2);
     y += 13; // 10px text + 3px gap
   } else {
     const lines = pfWrap(safeName, maxW, 1);
-    for (const line of lines.slice(0, 3)) {
+    for (const line of lines.slice(0, 2)) {
       pfCenter(cx, line, y, C.band, 1);
       y += 7;
     }
     y += 1;
   }
 
-  // Venue — wrap up to 2 lines
+  // Venue — wrap up to 2 lines, only if space remains
   const venueLines = pfWrap(gig.venue.toLowerCase().replace(/[^a-z0-9 \-']/g, ''), maxW, 1);
   for (const line of venueLines.slice(0, 2)) {
+    if (y + 7 > TIME_Y - 1) break;
     pfCenter(cx, line, y, C.venue, 1);
     y += 7;
   }
   y += 1;
 
-  // Genre
-  if (gig.genre && !/^undefined$/i.test(gig.genre)) {
+  // Genre — only if space remains
+  if (gig.genre && !/^undefined$/i.test(gig.genre) && y + 7 <= TIME_Y - 1) {
     const g = pfFit(gig.genre, maxW, 1);
-    if (g) { pfCenter(cx, g, y, C.genre, 1); y += 7; }
+    if (g) { pfCenter(cx, g, y, C.genre, 1); }
   }
-  y += 1;
 
-  // Time (left) + price / sold-out / tix (right)
-  if (gig.time) pfDraw(cx, gig.time, 2, y, C.time, 1);
+  // Time (left) + price / sold-out / tix (right) — always at fixed row
+  if (gig.time) pfDraw(cx, gig.time, 2, TIME_Y, C.time, 1);
   if (gig.soldOut) {
     const sw = pfWidth('sold out', 1);
-    pfDraw(cx, 'sold out', SIZE - 2 - sw, y, C.soldOut, 1);
+    pfDraw(cx, 'sold out', SIZE - 2 - sw, TIME_Y, C.soldOut, 1);
   } else if (gig.price) {
     const pw = pfWidth(gig.price, 1);
-    pfDraw(cx, gig.price, SIZE - 2 - pw, y, C.price, 1);
+    pfDraw(cx, gig.price, SIZE - 2 - pw, TIME_Y, C.price, 1);
   } else if (gig.ticketed) {
     const tw = pfWidth('tix', 1);
-    pfDraw(cx, 'tix', SIZE - 2 - tw, y, C.time, 1);
+    pfDraw(cx, 'tix', SIZE - 2 - tw, TIME_Y, C.time, 1);
   }
 
   drawDots(cx, idx, total);
@@ -248,7 +276,10 @@ function frameNoGigs() {
 }
 
 // ── Date helpers ───────────────────────────────────────────────────────────────
-function todayStr() { return new Date().toISOString().slice(0, 10); }
+function todayStr() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
 
 const MONTHS = { jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11 };
 
@@ -258,7 +289,7 @@ function parseDisplayDate(str) {
   if (!m) return null;
   const month = MONTHS[m[2].toLowerCase().slice(0, 3)];
   if (month === undefined) return null;
-  const d = new Date(parseInt(m[3]), month, parseInt(m[1]));
+  const d = new Date(Date.UTC(parseInt(m[3]), month, parseInt(m[1])));
   return d.toISOString().slice(0, 10);
 }
 
@@ -286,7 +317,7 @@ function parseUEADate(text) {
   if (partial) {
     const m = MONTHS[partial[2].toLowerCase().slice(0, 3)];
     if (m !== undefined) {
-      const d = new Date(new Date().getFullYear(), m, parseInt(partial[1]));
+      const d = new Date(Date.UTC(new Date().getFullYear(), m, parseInt(partial[1])));
       return d.toISOString().slice(0, 10);
     }
   }
@@ -327,7 +358,7 @@ function extractGenreFromText(text) {
 
 async function fetchUEAEventDetails(url) {
   try {
-    const html = await fetch(url, { headers: { 'User-Agent': UA } }).then(r => r.text());
+    const html = await tfetch(url, { headers: { 'User-Agent': UA } }, 10_000).then(r => r.text());
     const $ = cheerio.load(html);
 
     // Time: "Sat 14 March 2026 6:30pm"
@@ -346,7 +377,7 @@ async function fetchUEAGigs() {
   const date = todayStr();
   const url = `https://www.ueaticketbookings.co.uk/whats-on/?_sfm_start_date=${date}&_sfm_end_date=${date}`;
   try {
-    const html = await fetch(url, { headers: { 'User-Agent': UA } }).then(r => r.text());
+    const html = await tfetch(url, { headers: { 'User-Agent': UA } }).then(r => r.text());
     const $ = cheerio.load(html);
     const gigs = [];
     const seen = new Set();
@@ -409,7 +440,7 @@ async function fetchUEAGigs() {
     return gigs;
   } catch (e) {
     console.error('UEA scrape error:', e.message);
-    return [];
+    return null;
   }
 }
 
@@ -417,7 +448,7 @@ async function fetchUEAGigs() {
 async function fetchNACGigs() {
   const today = todayStr();
   try {
-    const html = await fetch('https://www.norwichartscentre.co.uk/whats-on/', {
+    const html = await tfetch('https://www.norwichartscentre.co.uk/whats-on/', {
       headers: { 'User-Agent': UA },
     }).then(r => r.text());
     const $ = cheerio.load(html);
@@ -455,7 +486,7 @@ async function fetchNACGigs() {
     return gigs;
   } catch (e) {
     console.error('NAC scrape error:', e.message);
-    return [];
+    return null;
   }
 }
 
@@ -463,7 +494,7 @@ async function fetchNACGigs() {
 async function fetchBrickmakers(pageUrl, venueName) {
   const today = todayStr();
   try {
-    const html = await fetch(pageUrl, { headers: { 'User-Agent': UA } }).then(r => r.text());
+    const html = await tfetch(pageUrl, { headers: { 'User-Agent': UA } }).then(r => r.text());
     const $ = cheerio.load(html);
     const gigs = [];
 
@@ -484,7 +515,7 @@ async function fetchBrickmakers(pageUrl, venueName) {
       if (!dateM) return;
       const month = MONTHS[dateM[2].toLowerCase().slice(0, 3)];
       if (month === undefined) return;
-      const eventDate = new Date(new Date().getFullYear(), month, parseInt(dateM[1])).toISOString().slice(0, 10);
+      const eventDate = new Date(Date.UTC(new Date().getFullYear(), month, parseInt(dateM[1]))).toISOString().slice(0, 10);
       if (eventDate !== today) return;
 
       // lines[1] = band name (skip if it looks like "Doors 7pm")
@@ -515,7 +546,7 @@ async function fetchBrickmakers(pageUrl, venueName) {
     return gigs;
   } catch (e) {
     console.error(`Brickmakers scrape error (${venueName}):`, e.message);
-    return [];
+    return null;
   }
 }
 
@@ -531,7 +562,7 @@ async function fetchNorwichTheatre() {
   const today = todayStr();
   const url = `https://norwichtheatre.org/whats-on/?genre[]=music&date=${today}`;
   try {
-    const html = await fetch(url, { headers: { 'User-Agent': UA } }).then(r => r.text());
+    const html = await tfetch(url, { headers: { 'User-Agent': UA } }).then(r => r.text());
     const $ = cheerio.load(html);
     const gigs = [];
 
@@ -555,23 +586,29 @@ async function fetchNorwichTheatre() {
     return gigs;
   } catch (e) {
     console.error('Norwich Theatre scrape error:', e.message);
-    return [];
+    return null;
   }
 }
 
 // ── Combined fetch + merge ────────────────────────────────────────────────────
+// Throws if every single source failed (e.g. DNS/network outage) so callers can
+// tell "nothing on tonight" apart from "couldn't check" and avoid blanking the
+// display with a false "no gigs" during an outage.
 async function fetchGigs() {
-  const [uea, nac, bm, bmB2, nt] = await Promise.all([
+  const results = await Promise.all([
     fetchUEAGigs(),
     fetchNACGigs(),
     fetchBrickmakers('https://www.brickmakersnorwich.co.uk/home/brickmakers/brickmakers-gigs', 'Brickmakers'),
     fetchBrickmakers('https://www.brickmakersnorwich.co.uk/b2/gig-guide', 'Brickmakers B2'),
     fetchNorwichTheatre(),
   ]);
+  if (results.every(r => r === null)) {
+    throw new Error('all sources failed — likely a network/DNS outage');
+  }
   // Merge entries for same gig — combine fields from both sources
   const map = new Map();
-  for (const g of [...uea, ...nac, ...bm, ...bmB2, ...nt]) {
-    const key = g.name.toLowerCase().replace(/[^a-z]/g, '').slice(0, 16);
+  for (const g of results.filter(Boolean).flat()) {
+    const key = g.name.toLowerCase().replace(/\s*[@–\-]\s*(epic|uea|arts|waterfront|brickmakers|norwich|lcr|playhouse|theatre|studio|voodoo).*/i, '').replace(/[^a-z]/g, '').slice(0, 16);
     const ex = map.get(key);
     if (!ex) { map.set(key, { ...g }); continue; }
     // Fill in missing fields from the other source
@@ -600,21 +637,24 @@ function acquireLock() {
 function startWatchdog() {
   setInterval(async () => {
     try {
-      const r = await fetch(`http://${PIXOO_IP}/post`, {
+      const r = await tfetch(`http://${PIXOO_IP}/post`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ Command: 'Channel/GetIndex' }),
-      });
+      }, 5_000);
       const j = await r.json();
       if (j.SelectIndex !== 0)
-        await fetch(`http://${PIXOO_IP}/post`, {
+        await tfetch(`http://${PIXOO_IP}/post`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ Command: 'Channel/SetIndex', SelectIndex: 0 }),
-        });
+        }, 5_000);
     } catch {}
   }, 60_000);
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
+const MIN_RETRY_MS = 30_000;   // first retry after a failure
+const MAX_RETRY_MS = 10 * 60_000; // cap backoff so it never waits as long as a full REFRESH_MS
+
 async function main() {
   acquireLock();
   console.log(`🎸 Norwich Gigs Pixoo  •  ${PIXOO_IP}  •  refresh ${REFRESH_MS/60000}min`);
@@ -623,7 +663,9 @@ async function main() {
     body: JSON.stringify({ Command: 'Draw/ResetHttpGifId' }),
   }).catch(() => {});
   startWatchdog();
+  let retryMs = MIN_RETRY_MS;
   while (true) {
+    let waitMs = REFRESH_MS;
     try {
       const gigs = await fetchGigs();
       console.log(`✅ ${gigs.length} gig${gigs.length !== 1 ? 's' : ''} tonight`);
@@ -632,10 +674,27 @@ async function main() {
         ? gigs.map((g, i) => frameGig(g, i, gigs.length))
         : [frameNoGigs()];
       await send(frames, FRAME_MS);
+      retryMs = MIN_RETRY_MS; // reset backoff after a fully successful cycle
     } catch (e) {
-      console.error('Error:', e.message);
+      console.error('Error:', e.message, '— will retry sooner instead of leaving the display stale');
+      waitMs = retryMs;
+      retryMs = Math.min(retryMs * 2, MAX_RETRY_MS);
     }
-    await new Promise(r => setTimeout(r, REFRESH_MS));
+    await new Promise(r => setTimeout(r, waitMs));
   }
 }
-main();
+
+// Last-resort safety net: if something escapes every try/catch above (e.g. a
+// bug in a scraper or the canvas renderer), log it and restart the loop
+// instead of letting the process die silently and the display freeze forever.
+function runForever() {
+  main().catch(e => {
+    console.error('main() crashed, restarting in 10s:', e.stack || e.message);
+    setTimeout(runForever, 10_000);
+  });
+}
+
+process.on('uncaughtException', e => console.error('uncaughtException:', e.stack || e.message));
+process.on('unhandledRejection', e => console.error('unhandledRejection:', e?.stack || e));
+
+runForever();
